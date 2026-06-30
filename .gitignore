@@ -1,0 +1,17 @@
+.aws-sam/
+.sam-cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.env
+.env.*
+.vscode/
+.idea/
+samconfig.toml
+.DS_Store
+Thumbs.db
