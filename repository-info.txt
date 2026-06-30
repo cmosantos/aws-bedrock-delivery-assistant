@@ -1,0 +1,8 @@
+NOME DO REPOSITORIO
+aws-bedrock-delivery-assistant
+
+DESCRICAO
+Assistente de delivery serverless com AWS Step Functions, Amazon Bedrock, Lambda, API Gateway e DynamoDB, capaz de interpretar pedidos em linguagem natural e orquestrar todo o fluxo de atendimento.
+
+TOPICOS
+aws, amazon-bedrock, step-functions, serverless, aws-lambda, dynamodb, api-gateway, generative-ai, python, aws-sam, dio

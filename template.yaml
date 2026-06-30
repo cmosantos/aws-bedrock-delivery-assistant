@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Assistente de delivery serverless com AWS Step Functions, Amazon Bedrock, Lambda, API Gateway e DynamoDB.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+  BedrockModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    Description: ID do modelo habilitado no Amazon Bedrock na regiao do deploy.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    MemorySize: 256
+    Timeout: 15
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+        APP_ENV: !Ref Environment
+
+Resources:
+  DeliveryHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - content-type
+        AllowMethods:
+          - POST
+          - OPTIONS
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub delivery-assistant-orders-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: aws-bedrock-delivery-assistant
+        - Key: Environment
+          Value: !Ref Environment
+
+  RequestHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/request_handler/
+      Handler: app.lambda_handler
+      Description: Recebe a mensagem HTTP e executa o workflow Express de forma sincrona.
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref DeliveryAssistantStateMachine
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - states:StartSyncExecution
+              Resource: !Ref DeliveryAssistantStateMachine
+      Events:
+        AssistantApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DeliveryHttpApi
+            Path: /assistant
+            Method: POST
+            PayloadFormatVersion: '2.0'
+
+  ValidateRequestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/validate_request/
+      Handler: app.lambda_handler
+      Description: Valida e normaliza os dados recebidos pelo assistente.
+
+  GetMenuFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/get_menu/
+      Handler: app.lambda_handler
+      Description: Retorna o cardapio permitido para contextualizar o modelo.
+
+  BedrockAssistantFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/bedrock_assistant/
+      Handler: app.lambda_handler
+      Description: Usa a API Converse do Amazon Bedrock para interpretar a mensagem do cliente.
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          USE_MOCK_BEDROCK: 'false'
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource:
+                - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/*
+                - !Sub arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*
+                - !Sub arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:application-inference-profile/*
+
+  CreateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/create_order/
+      Handler: app.lambda_handler
+      Description: Valida os itens, calcula o total e grava o pedido no DynamoDB.
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          LOCAL_MODE: 'false'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+
+  GetOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/get_order/
+      Handler: app.lambda_handler
+      Description: Consulta o status de um pedido existente.
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/states/delivery-assistant-${Environment}
+      RetentionInDays: 14
+
+  DeliveryAssistantStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub delivery-assistant-${Environment}
+      Type: EXPRESS
+      DefinitionUri: statemachine/delivery_assistant.asl.json
+      DefinitionSubstitutions:
+        ValidateRequestFunctionArn: !GetAtt ValidateRequestFunction.Arn
+        GetMenuFunctionArn: !GetAtt GetMenuFunction.Arn
+        BedrockAssistantFunctionArn: !GetAtt BedrockAssistantFunction.Arn
+        CreateOrderFunctionArn: !GetAtt CreateOrderFunction.Arn
+        GetOrderFunctionArn: !GetAtt GetOrderFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ValidateRequestFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GetMenuFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref BedrockAssistantFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CreateOrderFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GetOrderFunction
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: '*'
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !Sub '${StateMachineLogGroup.Arn}:*'
+        IncludeExecutionData: true
+        Level: ALL
+      Tracing:
+        Enabled: true
+      Tags:
+        Project: aws-bedrock-delivery-assistant
+        Environment: !Ref Environment
+
+Outputs:
+  AssistantEndpoint:
+    Description: Endpoint HTTP POST do assistente.
+    Value: !Sub https://${DeliveryHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${Environment}/assistant
+  StateMachineArn:
+    Description: ARN do workflow do AWS Step Functions.
+    Value: !Ref DeliveryAssistantStateMachine
+  OrdersTableName:
+    Description: Nome da tabela de pedidos.
+    Value: !Ref OrdersTable
+  BedrockModel:
+    Description: Modelo configurado para o assistente.
+    Value: !Ref BedrockModelId

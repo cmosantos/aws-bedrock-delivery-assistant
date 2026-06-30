@@ -1,0 +1,226 @@
+{
+  "Comment": "Assistente de delivery orquestrado com AWS Step Functions e Amazon Bedrock",
+  "StartAt": "Validar requisicao",
+  "States": {
+    "Validar requisicao": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ValidateRequestFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "payload.$": "$.Payload"
+      },
+      "ResultPath": "$.validation",
+      "Next": "Requisicao valida?",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ]
+    },
+    "Requisicao valida?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.validation.payload.valid",
+          "BooleanEquals": true,
+          "Next": "Obter cardapio"
+        }
+      ],
+      "Default": "Retornar erro de validacao"
+    },
+    "Retornar erro de validacao": {
+      "Type": "Pass",
+      "Parameters": {
+        "statusCode": 400,
+        "body": {
+          "intent": "INVALID_REQUEST",
+          "reply.$": "$.validation.payload.reply",
+          "errors.$": "$.validation.payload.errors"
+        }
+      },
+      "End": true
+    },
+    "Obter cardapio": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${GetMenuFunctionArn}",
+        "Payload.$": "$.validation.payload"
+      },
+      "ResultSelector": {
+        "payload.$": "$.Payload"
+      },
+      "ResultPath": "$.menu",
+      "Next": "Interpretar mensagem com Bedrock",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ]
+    },
+    "Interpretar mensagem com Bedrock": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BedrockAssistantFunctionArn}",
+        "Payload": {
+          "message.$": "$.validation.payload.message",
+          "user_id.$": "$.validation.payload.user_id",
+          "session_id.$": "$.validation.payload.session_id",
+          "locale.$": "$.validation.payload.locale",
+          "menu.$": "$.menu.payload.items"
+        }
+      },
+      "ResultSelector": {
+        "payload.$": "$.Payload"
+      },
+      "ResultPath": "$.assistant",
+      "Next": "Qual e a intencao?",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.bedrock_error",
+          "Next": "Retornar indisponibilidade"
+        }
+      ]
+    },
+    "Qual e a intencao?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.assistant.payload.intent",
+          "StringEquals": "CREATE_ORDER",
+          "Next": "Criar pedido"
+        },
+        {
+          "Variable": "$.assistant.payload.intent",
+          "StringEquals": "ORDER_STATUS",
+          "Next": "Consultar pedido"
+        }
+      ],
+      "Default": "Retornar resposta do assistente"
+    },
+    "Criar pedido": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${CreateOrderFunctionArn}",
+        "Payload": {
+          "user_id.$": "$.validation.payload.user_id",
+          "session_id.$": "$.validation.payload.session_id",
+          "requested_items.$": "$.assistant.payload.items",
+          "menu.$": "$.menu.payload.items",
+          "assistant_reply.$": "$.assistant.payload.reply"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "End": true,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.order_error",
+          "Next": "Retornar indisponibilidade"
+        }
+      ]
+    },
+    "Consultar pedido": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${GetOrderFunctionArn}",
+        "Payload": {
+          "user_id.$": "$.validation.payload.user_id",
+          "order_id.$": "$.assistant.payload.order_id"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "End": true,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.status_error",
+          "Next": "Retornar indisponibilidade"
+        }
+      ]
+    },
+    "Retornar resposta do assistente": {
+      "Type": "Pass",
+      "Parameters": {
+        "statusCode": 200,
+        "body": {
+          "intent.$": "$.assistant.payload.intent",
+          "reply.$": "$.assistant.payload.reply",
+          "session_id.$": "$.validation.payload.session_id",
+          "suggestions.$": "$.assistant.payload.suggestions"
+        }
+      },
+      "End": true
+    },
+    "Retornar indisponibilidade": {
+      "Type": "Pass",
+      "Parameters": {
+        "statusCode": 503,
+        "body": {
+          "intent": "SERVICE_UNAVAILABLE",
+          "reply": "Nao foi possivel concluir o atendimento agora. Tente novamente em instantes."
+        }
+      },
+      "End": true
+    }
+  }
+}
